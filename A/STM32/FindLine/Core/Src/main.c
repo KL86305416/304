@@ -26,12 +26,13 @@
 #include "gray_sensor.h"
 #include "line_follower.h"
 #include "line_follower_config.h"
+#include "mpu6050.h"
 #include "oled.h"
-#include "servo.h"
 #include "stm32g431xx.h"
 #include "stm32g4xx_hal_gpio.h"
 #include "tb6612.h"
 
+#include <stddef.h>
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -42,7 +43,7 @@ typedef enum
 {
   APP_SCREEN_MENU = 0,
   APP_SCREEN_LINE_FOLLOWER = 1,
-  APP_SCREEN_SERVO_DEBUG = 2
+  APP_SCREEN_MPU6050_DEBUG = 2
 } App_Screen_t;
 
 typedef enum
@@ -69,9 +70,9 @@ typedef struct
 /* USER CODE BEGIN PD */
 #define APP_BUTTON_ACTIVE_STATE  GPIO_PIN_RESET
 #define APP_BUTTON_DEBOUNCE_MS   35U
-#define APP_MENU_ITEM_COUNT      2U
-#define APP_SERVO_CONTROL_PERIOD_MS       2U
-#define APP_SERVO_SPEED_DEG_X10_PER_SEC   3000U
+#define APP_MENU_ITEM_COUNT      1U
+#define APP_MPU6050_UPDATE_MS             100U
+#define APP_MPU6050_RETRY_MS              1000U
 
 /* USER CODE END PD */
 
@@ -88,9 +89,12 @@ static uint32_t oled_last_update_tick = 0U;
 static App_Screen_t app_screen = APP_SCREEN_MENU;
 static uint8_t menu_selected_index = 0U;
 static uint8_t menu_dirty = 1U;
-static uint32_t servo_last_move_tick[SERVO_CHANNEL_COUNT] = {0U, 0U};
-static int8_t servo_move_direction[SERVO_CHANNEL_COUNT] = {0, 0};
-static uint8_t servo_ignore_buttons_until_release = 0U;
+static MPU6050_Data_t mpu6050_data;
+static MPU6050_Result_t mpu6050_status = MPU6050_RESULT_NOT_FOUND;
+static uint32_t mpu6050_read_count = 0U;
+static uint32_t mpu6050_error_count = 0U;
+static uint32_t mpu6050_last_retry_tick = 0U;
+static uint8_t mpu6050_int_pin = 0U;
 static App_Button_t app_buttons[APP_BUTTON_COUNT] = {
   {GPIOC, GPIO_PIN_3, GPIO_PIN_SET, GPIO_PIN_SET, 0U},
   {GPIOC, GPIO_PIN_2, GPIO_PIN_SET, GPIO_PIN_SET, 0U},
@@ -105,18 +109,17 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void App_ButtonInit(void);
 static uint8_t App_ButtonScan(void);
-static uint8_t App_ButtonPressedMask(void);
 static void App_EnterMenu(void);
 static void App_EnterLineFollower(void);
-static void App_EnterServoDebug(void);
 static void App_HandleMenuButtons(uint8_t button_events);
 static void App_ShowMenuScreen(void);
 static void App_ShowLineStatus(const LineFollower_Status_t *status);
-static void App_UpdateServoDebug(uint8_t button_events);
-static void App_UpdateServoMotion(Servo_Channel_t channel,
-                                  int8_t direction,
-                                  uint32_t now);
-static void App_ShowServoDebugScreen(void);
+static void App_UpdateMpu6050Debug(void);
+static void App_ShowMpu6050DebugScreen(void);
+static void App_FormatSignedX10(char *line,
+                                 size_t line_size,
+                                 const char *prefix,
+                                 int32_t value_x10);
 
 /* USER CODE END PFP */
 
@@ -158,8 +161,8 @@ int main(void)
   GraySensor_Init();
   TB6612_Init();
   LineFollower_Init();
-  Servo_Init();
   MX_I2C2_Init();
+  MX_I2C3_Init();
   /* USER CODE BEGIN 2 */
   if (OLED_Init() == HAL_OK)
   {
@@ -187,13 +190,11 @@ int main(void)
       if ((oled_ready != 0U) && (menu_dirty != 0U))
       {
         App_ShowMenuScreen();
-        oled_last_update_tick = HAL_GetTick();
       }
     }
     else
     {
-      if (((button_events & (1U << APP_BUTTON_BACK)) != 0U) &&
-          (app_screen != APP_SCREEN_SERVO_DEBUG))
+      if ((button_events & (1U << APP_BUTTON_BACK)) != 0U)
       {
         App_EnterMenu();
       }
@@ -210,10 +211,9 @@ int main(void)
           oled_last_update_tick = HAL_GetTick();
         }
       }
-      else if (app_screen == APP_SCREEN_SERVO_DEBUG)
+      else if (app_screen == APP_SCREEN_MPU6050_DEBUG)
       {
-        App_UpdateServoDebug(button_events);
-        loop_delay_ms = APP_SERVO_CONTROL_PERIOD_MS;
+        App_UpdateMpu6050Debug();
       }
     }
 
@@ -310,21 +310,6 @@ static uint8_t App_ButtonScan(void)
   return events;
 }
 
-static uint8_t App_ButtonPressedMask(void)
-{
-  uint8_t pressed_mask = 0U;
-
-  for (uint8_t i = 0U; i < APP_BUTTON_COUNT; i++)
-  {
-    if (app_buttons[i].stable_state == APP_BUTTON_ACTIVE_STATE)
-    {
-      pressed_mask |= (uint8_t)(1U << i);
-    }
-  }
-
-  return pressed_mask;
-}
-
 static void App_EnterMenu(void)
 {
   LineFollower_Stop();
@@ -337,27 +322,6 @@ static void App_EnterLineFollower(void)
   LineFollower_Init();
   app_screen = APP_SCREEN_LINE_FOLLOWER;
   oled_last_update_tick = 0U;
-}
-
-static void App_EnterServoDebug(void)
-{
-  uint32_t now = HAL_GetTick();
-
-  Servo_CenterChannel(SERVO_CHANNEL_1);
-  Servo_CenterChannel(SERVO_CHANNEL_2);
-  servo_last_move_tick[SERVO_CHANNEL_1] = now;
-  servo_last_move_tick[SERVO_CHANNEL_2] = now;
-  servo_move_direction[SERVO_CHANNEL_1] = 0;
-  servo_move_direction[SERVO_CHANNEL_2] = 0;
-  servo_ignore_buttons_until_release = App_ButtonPressedMask();
-  app_screen = APP_SCREEN_SERVO_DEBUG;
-  oled_last_update_tick = 0U;
-
-  if (oled_ready != 0U)
-  {
-    App_ShowServoDebugScreen();
-    oled_last_update_tick = now;
-  }
 }
 
 static void App_HandleMenuButtons(uint8_t button_events)
@@ -391,10 +355,6 @@ static void App_HandleMenuButtons(uint8_t button_events)
     {
       App_EnterLineFollower();
     }
-    else if (menu_selected_index == 1U)
-    {
-      App_EnterServoDebug();
-    }
   }
 }
 
@@ -409,11 +369,6 @@ static void App_ShowMenuScreen(void)
   (void)snprintf(line, sizeof(line), "%c Line Follow",
                  (menu_selected_index == 0U) ? '>' : ' ');
   OLED_SetCursor(0, 16);
-  OLED_WriteString(line, OLED_COLOR_WHITE);
-
-  (void)snprintf(line, sizeof(line), "%c Servo Debug",
-                 (menu_selected_index == 1U) ? '>' : ' ');
-  OLED_SetCursor(0, 24);
   OLED_WriteString(line, OLED_COLOR_WHITE);
 
   (void)OLED_UpdateScreen();
@@ -456,139 +411,135 @@ static void App_ShowLineStatus(const LineFollower_Status_t *status)
   (void)OLED_UpdateScreen();
 }
 
-static void App_UpdateServoDebug(uint8_t button_events)
+static void App_UpdateMpu6050Debug(void)
 {
-  uint8_t pressed_buttons = App_ButtonPressedMask();
   uint32_t now = HAL_GetTick();
-  uint8_t active_buttons;
-  int8_t servo1_direction = 0;
-  int8_t servo2_direction = 0;
 
-  (void)button_events;
-
-  servo_ignore_buttons_until_release &= pressed_buttons;
-  active_buttons = (uint8_t)(pressed_buttons & ~servo_ignore_buttons_until_release);
-
-  if (((active_buttons & (1U << APP_BUTTON_UP)) != 0U) &&
-      ((active_buttons & (1U << APP_BUTTON_DOWN)) == 0U))
+  if ((mpu6050_status != MPU6050_RESULT_OK) &&
+      ((now - mpu6050_last_retry_tick) >= APP_MPU6050_RETRY_MS))
   {
-    servo1_direction = 1;
-  }
-  else if (((active_buttons & (1U << APP_BUTTON_DOWN)) != 0U) &&
-           ((active_buttons & (1U << APP_BUTTON_UP)) == 0U))
-  {
-    servo1_direction = -1;
+    mpu6050_status = MPU6050_Init();
+    mpu6050_last_retry_tick = now;
   }
 
-  if (((active_buttons & (1U << APP_BUTTON_OK)) != 0U) &&
-      ((active_buttons & (1U << APP_BUTTON_BACK)) == 0U))
-  {
-    servo2_direction = 1;
-  }
-  else if (((active_buttons & (1U << APP_BUTTON_BACK)) != 0U) &&
-           ((active_buttons & (1U << APP_BUTTON_OK)) == 0U))
-  {
-    servo2_direction = -1;
-  }
-
-  App_UpdateServoMotion(SERVO_CHANNEL_1, servo1_direction, now);
-  App_UpdateServoMotion(SERVO_CHANNEL_2, servo2_direction, now);
-}
-
-static void App_UpdateServoMotion(Servo_Channel_t channel,
-                                  int8_t direction,
-                                  uint32_t now)
-{
-  if (channel >= SERVO_CHANNEL_COUNT)
+  if ((now - oled_last_update_tick) < APP_MPU6050_UPDATE_MS)
   {
     return;
   }
 
-  if (direction == 0)
-  {
-    servo_last_move_tick[channel] = now;
-    servo_move_direction[channel] = 0;
-  }
-  else if (direction != servo_move_direction[channel])
-  {
-    servo_last_move_tick[channel] = now;
-    servo_move_direction[channel] = direction;
-  }
-  else
-  {
-    uint32_t elapsed_ms = now - servo_last_move_tick[channel];
+  mpu6050_int_pin = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_12) == GPIO_PIN_SET) ? 1U : 0U;
 
-    if (elapsed_ms != 0U)
+  if (mpu6050_status == MPU6050_RESULT_OK)
+  {
+    mpu6050_status = MPU6050_ReadData(&mpu6050_data);
+    if (mpu6050_status == MPU6050_RESULT_OK)
     {
-      uint32_t delta_x10 = (APP_SERVO_SPEED_DEG_X10_PER_SEC * elapsed_ms) / 1000U;
-
-      if (delta_x10 == 0U)
-      {
-        delta_x10 = 1U;
-      }
-
-      if (direction > 0)
-      {
-        uint16_t angle_x10 = Servo_GetChannelAngleX10(channel);
-
-        if (angle_x10 >= SERVO_MAX_ANGLE_X10)
-        {
-          Servo_SetChannelAngleX10(channel, SERVO_MAX_ANGLE_X10);
-        }
-        else if (delta_x10 >= (uint32_t)(SERVO_MAX_ANGLE_X10 - angle_x10))
-        {
-          Servo_SetChannelAngleX10(channel, SERVO_MAX_ANGLE_X10);
-        }
-        else
-        {
-          Servo_SetChannelAngleX10(channel, (uint16_t)(angle_x10 + delta_x10));
-        }
-      }
-      else
-      {
-        uint16_t angle_x10 = Servo_GetChannelAngleX10(channel);
-
-        if (angle_x10 <= SERVO_MIN_ANGLE_X10)
-        {
-          Servo_SetChannelAngleX10(channel, SERVO_MIN_ANGLE_X10);
-        }
-        else if (delta_x10 >= angle_x10)
-        {
-          Servo_SetChannelAngleX10(channel, SERVO_MIN_ANGLE_X10);
-        }
-        else
-        {
-          Servo_SetChannelAngleX10(channel, (uint16_t)(angle_x10 - delta_x10));
-        }
-      }
-
-      servo_last_move_tick[channel] = now;
+      mpu6050_read_count++;
+    }
+    else
+    {
+      mpu6050_error_count++;
+      mpu6050_last_retry_tick = now;
     }
   }
+
+  if (oled_ready != 0U)
+  {
+    App_ShowMpu6050DebugScreen();
+  }
+
+  oled_last_update_tick = now;
 }
 
-static void App_ShowServoDebugScreen(void)
+static void App_ShowMpu6050DebugScreen(void)
 {
   char line[22];
-  uint16_t servo1_angle_x10 = Servo_GetChannelAngleX10(SERVO_CHANNEL_1);
-  uint16_t servo2_angle_x10 = Servo_GetChannelAngleX10(SERVO_CHANNEL_2);
 
   OLED_Clear();
   OLED_SetCursor(0, 0);
-  OLED_WriteString("Dual Servo Debug", OLED_COLOR_WHITE);
+  OLED_WriteString("MPU6050 Debug", OLED_COLOR_WHITE);
 
-  OLED_SetCursor(0, 8);
-  OLED_WriteString("S1 PA6  S2 PA7", OLED_COLOR_WHITE);
+  if (mpu6050_status == MPU6050_RESULT_OK)
+  {
+    (void)snprintf(line, sizeof(line), "A:0x%02X W:0x%02X",
+                   (unsigned int)mpu6050_data.address_7bit,
+                   (unsigned int)mpu6050_data.who_am_i);
+    OLED_SetCursor(0, 8);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
 
-  (void)snprintf(line, sizeof(line), "S1:%3u.%u S2:%3u.%u",
-                 (unsigned int)(servo1_angle_x10 / SERVO_ANGLE_SCALE),
-                 (unsigned int)(servo1_angle_x10 % SERVO_ANGLE_SCALE),
-                 (unsigned int)(servo2_angle_x10 / SERVO_ANGLE_SCALE),
-                 (unsigned int)(servo2_angle_x10 % SERVO_ANGLE_SCALE));
-  OLED_SetCursor(0, 16);
-  OLED_WriteString(line, OLED_COLOR_WHITE);
+    App_FormatSignedX10(line, sizeof(line), "GX", mpu6050_data.gyro_dps_x10_x);
+    OLED_SetCursor(0, 16);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
+
+    App_FormatSignedX10(line, sizeof(line), "GY", mpu6050_data.gyro_dps_x10_y);
+    OLED_SetCursor(0, 24);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
+
+    App_FormatSignedX10(line, sizeof(line), "GZ", mpu6050_data.gyro_dps_x10_z);
+    OLED_SetCursor(0, 32);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
+
+    (void)snprintf(line, sizeof(line), "CNT:%lu",
+                   (unsigned long)mpu6050_read_count);
+    OLED_SetCursor(0, 40);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
+
+    (void)snprintf(line, sizeof(line), "INT:%u RDY:%u E:%lu",
+                   (unsigned int)mpu6050_int_pin,
+                   (unsigned int)(mpu6050_data.int_status & 0x01U),
+                   (unsigned long)mpu6050_error_count);
+    OLED_SetCursor(0, 48);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
+  }
+  else
+  {
+    (void)snprintf(line, sizeof(line), "ERR:%s",
+                   MPU6050_ResultToString(mpu6050_status));
+    OLED_SetCursor(0, 8);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
+
+    (void)snprintf(line, sizeof(line), "WHO:0x%02X A:0x%02X",
+                   (unsigned int)MPU6050_GetWhoAmI(),
+                   (unsigned int)MPU6050_GetAddress7Bit());
+    OLED_SetCursor(0, 16);
+    OLED_WriteString(line, OLED_COLOR_WHITE);
+
+    OLED_SetCursor(0, 24);
+    OLED_WriteString("SCL PC8 SDA PC9", OLED_COLOR_WHITE);
+
+    OLED_SetCursor(0, 32);
+    OLED_WriteString("VCC 5V GND", OLED_COLOR_WHITE);
+
+    OLED_SetCursor(0, 40);
+    OLED_WriteString("Addr 0x68/0x69", OLED_COLOR_WHITE);
+  }
 
   (void)OLED_UpdateScreen();
+}
+
+static void App_FormatSignedX10(char *line,
+                                 size_t line_size,
+                                 const char *prefix,
+                                 int32_t value_x10)
+{
+  char sign = ' ';
+  uint32_t abs_value;
+
+  if (value_x10 < 0)
+  {
+    sign = '-';
+    abs_value = (uint32_t)(-value_x10);
+  }
+  else
+  {
+    abs_value = (uint32_t)value_x10;
+  }
+
+  (void)snprintf(line, line_size, "%s:%c%4lu.%lu dps",
+                 prefix,
+                 sign,
+                 (unsigned long)(abs_value / 10U),
+                 (unsigned long)(abs_value % 10U));
 }
 
 /* USER CODE END 4 */

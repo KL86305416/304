@@ -1,0 +1,18 @@
+﻿{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "STM32: Debug FindLine (ST-LINK)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/A/STM32/FindLine",
+            "executable": "${workspaceFolder}/A/STM32/FindLine/build/Debug/FindLine.elf",
+            "servertype": "stlink",
+            "device": "STM32G431RBTx",
+            "interface": "swd",
+            "runToEntryPoint": "main",
+            "preLaunchTask": "STM32: Build FindLine Debug",
+            "showDevDebugOutput": "none"
+        }
+    ]
+}

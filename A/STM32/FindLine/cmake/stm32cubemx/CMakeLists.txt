@@ -25,7 +25,8 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/oled.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/gray_sensor.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/line_follower.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/servo.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/mpu6050.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/pd42s1.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/tb6612.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32g4xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32g4xx_hal_msp.c

@@ -15,7 +15,7 @@
 #define LINE_FOLLOWER_PID_KI                      0.0f
 #define LINE_FOLLOWER_PID_KD                      9.0f
 
-#define LINE_FOLLOWER_LOST_TURN_DUTY              500
+#define LINE_FOLLOWER_LOST_TURN_DUTY              420
 #define LINE_FOLLOWER_LINE_SIDE_MEMORY_THRESHOLD  0.5f
 #define LINE_FOLLOWER_BIG_TURN_FLAG               2.0f
 

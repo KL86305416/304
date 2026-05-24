@@ -1,0 +1,26 @@
+{
+    "folders": [
+        {
+            "name": "FindLine",
+            "path": "A/STM32/FindLine"
+        }
+    ],
+    "settings": {
+        "cmake.sourceDirectory": "${workspaceFolder}",
+        "cmake.useCMakePresets": "always",
+        "cmake.configureOnOpen": true,
+        "cmake.cmakePath": "cmake",
+        "cmake.preferredGenerators": [
+            "Ninja"
+        ],
+        "cortex-debug.armToolchainPath.windows": "D:/gctools/STM32/STM32CubeCLT_1.18.0/GNU-tools-for-STM32/bin",
+        "cortex-debug.gdbPath.windows": "D:/gctools/STM32/STM32CubeCLT_1.18.0/GNU-tools-for-STM32/bin/arm-none-eabi-gdb.exe",
+        "cortex-debug.stlinkPath.windows": "D:/gctools/STM32/STM32CubeCLT_1.18.0/STLink-gdb-server/bin/ST-LINK_gdbserver.exe",
+        "stm32cube-ide-clangd.path": "cube",
+        "stm32cube-ide-clangd.arguments": [
+            "starm-clangd",
+            "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gcc*",
+            "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-g++*"
+        ]
+    }
+}
