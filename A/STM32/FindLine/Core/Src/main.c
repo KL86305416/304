@@ -28,6 +28,9 @@
 #include "line_follower_config.h"
 #include "mpu6050.h"
 #include "oled.h"
+#include "openmv_tracker_control.h"
+#include "openmv_uart.h"
+#include "pd42s1_debug.h"
 #include "stm32g431xx.h"
 #include "stm32g4xx_hal_gpio.h"
 #include "tb6612.h"
@@ -43,7 +46,9 @@ typedef enum
 {
   APP_SCREEN_MENU = 0,
   APP_SCREEN_LINE_FOLLOWER = 1,
-  APP_SCREEN_MPU6050_DEBUG = 2
+  APP_SCREEN_MPU6050_DEBUG = 2,
+  APP_SCREEN_PD42S1_DEBUG = 3,
+  APP_SCREEN_BLOB_TRACK = 4
 } App_Screen_t;
 
 typedef enum
@@ -70,9 +75,10 @@ typedef struct
 /* USER CODE BEGIN PD */
 #define APP_BUTTON_ACTIVE_STATE  GPIO_PIN_RESET
 #define APP_BUTTON_DEBOUNCE_MS   35U
-#define APP_MENU_ITEM_COUNT      1U
+#define APP_MENU_ITEM_COUNT      3U
 #define APP_MPU6050_UPDATE_MS             100U
 #define APP_MPU6050_RETRY_MS              1000U
+#define APP_LINE_TRACKER_UPDATE_MS        50U
 
 /* USER CODE END PD */
 
@@ -94,6 +100,7 @@ static MPU6050_Result_t mpu6050_status = MPU6050_RESULT_NOT_FOUND;
 static uint32_t mpu6050_read_count = 0U;
 static uint32_t mpu6050_error_count = 0U;
 static uint32_t mpu6050_last_retry_tick = 0U;
+static uint32_t line_tracker_last_update_tick = 0U;
 static uint8_t mpu6050_int_pin = 0U;
 static App_Button_t app_buttons[APP_BUTTON_COUNT] = {
   {GPIOC, GPIO_PIN_3, GPIO_PIN_SET, GPIO_PIN_SET, 0U},
@@ -111,9 +118,13 @@ static void App_ButtonInit(void);
 static uint8_t App_ButtonScan(void);
 static void App_EnterMenu(void);
 static void App_EnterLineFollower(void);
+static void App_EnterPd42s1Debug(void);
+static void App_EnterBlobTrack(void);
 static void App_HandleMenuButtons(uint8_t button_events);
 static void App_ShowMenuScreen(void);
 static void App_ShowLineStatus(const LineFollower_Status_t *status);
+static void App_ShowPd42s1DebugScreen(void);
+static void App_ShowBlobTrackScreen(void);
 static void App_UpdateMpu6050Debug(void);
 static void App_ShowMpu6050DebugScreen(void);
 static void App_FormatSignedX10(char *line,
@@ -163,6 +174,7 @@ int main(void)
   LineFollower_Init();
   MX_I2C2_Init();
   MX_I2C3_Init();
+  (void)OpenMV_UART_Init();
   /* USER CODE BEGIN 2 */
   if (OLED_Init() == HAL_OK)
   {
@@ -201,19 +213,34 @@ int main(void)
       else if (app_screen == APP_SCREEN_LINE_FOLLOWER)
       {
         LineFollower_Status_t line_status;
+        uint32_t now = HAL_GetTick();
 
         line_status = LineFollower_Update();
 
+        if ((now - line_tracker_last_update_tick) >= APP_LINE_TRACKER_UPDATE_MS)
+        {
+          OpenMV_TrackerControl_Update();
+          line_tracker_last_update_tick = now;
+        }
+
         if ((oled_ready != 0U) &&
-            ((HAL_GetTick() - oled_last_update_tick) >= LINE_FOLLOWER_OLED_UPDATE_MS))
+            ((now - oled_last_update_tick) >= LINE_FOLLOWER_OLED_UPDATE_MS))
         {
           App_ShowLineStatus(&line_status);
-          oled_last_update_tick = HAL_GetTick();
+          oled_last_update_tick = now;
         }
       }
       else if (app_screen == APP_SCREEN_MPU6050_DEBUG)
       {
         App_UpdateMpu6050Debug();
+      }
+      else if (app_screen == APP_SCREEN_PD42S1_DEBUG)
+      {
+        PD42S1_Debug_Update();
+      }
+      else if (app_screen == APP_SCREEN_BLOB_TRACK)
+      {
+        OpenMV_TrackerControl_Update();
       }
     }
 
@@ -313,6 +340,18 @@ static uint8_t App_ButtonScan(void)
 static void App_EnterMenu(void)
 {
   LineFollower_Stop();
+  if (app_screen == APP_SCREEN_PD42S1_DEBUG)
+  {
+    PD42S1_Debug_DeInit();
+  }
+  else if (app_screen == APP_SCREEN_LINE_FOLLOWER)
+  {
+    OpenMV_TrackerControl_DeInit();
+  }
+  else if (app_screen == APP_SCREEN_BLOB_TRACK)
+  {
+    OpenMV_TrackerControl_DeInit();
+  }
   app_screen = APP_SCREEN_MENU;
   menu_dirty = 1U;
 }
@@ -320,8 +359,36 @@ static void App_EnterMenu(void)
 static void App_EnterLineFollower(void)
 {
   LineFollower_Init();
+  OpenMV_TrackerControl_Init();
   app_screen = APP_SCREEN_LINE_FOLLOWER;
   oled_last_update_tick = 0U;
+  line_tracker_last_update_tick = 0U;
+}
+
+static void App_EnterPd42s1Debug(void)
+{
+  LineFollower_Stop();
+  PD42S1_Debug_Init();
+  app_screen = APP_SCREEN_PD42S1_DEBUG;
+  oled_last_update_tick = 0U;
+
+  if (oled_ready != 0U)
+  {
+    App_ShowPd42s1DebugScreen();
+  }
+}
+
+static void App_EnterBlobTrack(void)
+{
+  LineFollower_Stop();
+  OpenMV_TrackerControl_Init();
+  app_screen = APP_SCREEN_BLOB_TRACK;
+  oled_last_update_tick = 0U;
+
+  if (oled_ready != 0U)
+  {
+    App_ShowBlobTrackScreen();
+  }
 }
 
 static void App_HandleMenuButtons(uint8_t button_events)
@@ -355,6 +422,14 @@ static void App_HandleMenuButtons(uint8_t button_events)
     {
       App_EnterLineFollower();
     }
+    else if (menu_selected_index == 1U)
+    {
+      App_EnterPd42s1Debug();
+    }
+    else if (menu_selected_index == 2U)
+    {
+      App_EnterBlobTrack();
+    }
   }
 }
 
@@ -369,6 +444,16 @@ static void App_ShowMenuScreen(void)
   (void)snprintf(line, sizeof(line), "%c Line Follow",
                  (menu_selected_index == 0U) ? '>' : ' ');
   OLED_SetCursor(0, 16);
+  OLED_WriteString(line, OLED_COLOR_WHITE);
+
+  (void)snprintf(line, sizeof(line), "%c Motor Debug",
+                 (menu_selected_index == 1U) ? '>' : ' ');
+  OLED_SetCursor(0, 24);
+  OLED_WriteString(line, OLED_COLOR_WHITE);
+
+  (void)snprintf(line, sizeof(line), "%c Blob Track",
+                 (menu_selected_index == 2U) ? '>' : ' ');
+  OLED_SetCursor(0, 32);
   OLED_WriteString(line, OLED_COLOR_WHITE);
 
   (void)OLED_UpdateScreen();
@@ -408,6 +493,22 @@ static void App_ShowLineStatus(const LineFollower_Status_t *status)
   OLED_SetCursor(0, 24);
   OLED_WriteString(line, OLED_COLOR_WHITE);
 
+  (void)OLED_UpdateScreen();
+}
+
+static void App_ShowPd42s1DebugScreen(void)
+{
+  OLED_Clear();
+  OLED_SetCursor(0, 0);
+  OLED_WriteString("Motor Debug", OLED_COLOR_WHITE);
+  (void)OLED_UpdateScreen();
+}
+
+static void App_ShowBlobTrackScreen(void)
+{
+  OLED_Clear();
+  OLED_SetCursor(0, 0);
+  OLED_WriteString("Blob Track", OLED_COLOR_WHITE);
   (void)OLED_UpdateScreen();
 }
 
